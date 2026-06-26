@@ -17812,6 +17812,12 @@ pub fn provided_init_features(config: &UserConfig) -> InitFeatures {
 
 	if config.channel_handshake_config.negotiate_anchor_zero_fee_commitments {
 		features.set_anchor_zero_fee_commitments_optional();
+
+		// `option_htlcs_claim_tx` builds on top of `option_zero_fee_commitments`, so we only
+		// advertise it alongside the latter.
+		if config.channel_handshake_config.negotiate_htlcs_claim_tx {
+			features.set_htlcs_claim_tx_optional();
+		}
 	}
 
 	if config.enable_htlc_hold {

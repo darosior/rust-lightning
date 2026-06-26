@@ -241,6 +241,17 @@ pub struct ChannelHandshakeConfig {
 	/// [`Event::OpenChannelRequest`]: crate::events::Event::OpenChannelRequest
 	pub negotiate_anchor_zero_fee_commitments: bool,
 
+	/// Set to enable the experimental `option_htlcs_claim_tx` channel type, which commits (via
+	/// `OP_TEMPLATEHASH`) to a v3 claim transaction in the preimage spend path of offered HTLC
+	/// outputs, closing the last on-chain pinning gap in Lightning.
+	///
+	/// This option requires [`Self::negotiate_anchor_zero_fee_commitments`] to be set as it builds
+	/// on top of `option_zero_fee_commitments`; if the counterparty does not understand it (or we
+	/// fall back to a different channel type) it is silently dropped.
+	///
+	/// Default value: `false`
+	pub negotiate_htlcs_claim_tx: bool,
+
 	/// The maximum number of HTLCs in-flight from our counterparty towards us at the same time.
 	///
 	/// Increasing the value can help improve liquidity and stability in
@@ -272,6 +283,7 @@ impl Default for ChannelHandshakeConfig {
 			their_channel_reserve_proportional_millionths: 10_000,
 			negotiate_anchors_zero_fee_htlc_tx: true,
 			negotiate_anchor_zero_fee_commitments: false,
+			negotiate_htlcs_claim_tx: false,
 			our_max_accepted_htlcs: 50,
 		}
 	}
@@ -304,6 +316,7 @@ impl Readable for ChannelHandshakeConfig {
 			their_channel_reserve_proportional_millionths: Readable::read(reader)?,
 			negotiate_anchors_zero_fee_htlc_tx: Readable::read(reader)?,
 			negotiate_anchor_zero_fee_commitments: Readable::read(reader)?,
+			negotiate_htlcs_claim_tx: Readable::read(reader)?,
 			our_max_accepted_htlcs: Readable::read(reader)?,
 		})
 	}

@@ -293,6 +293,51 @@ impl CounterpartyOfferedHTLCOutput {
 			outpoint_confirmation_height,
 		}
 	}
+
+	/// Builds the templated v3 HTLC claim transaction spending this offered HTLC output via the
+	/// preimage (`htlc_success`) path, as required by `option_htlcs_claim_tx`.
+	///
+	/// Unlike the malleable sweep used for other offered HTLC outputs, this transaction is fixed
+	/// (a single input spending `outpoint`, a single zero-fee P2WPKH output for the full HTLC
+	/// value), broadcast verbatim, and committed to via `OP_TEMPLATEHASH`. It carries no
+	/// counterparty signature: satisfaction is the preimage plus the leaf script.
+	///
+	/// TODO(option_htlcs_claim_tx): because the claim transaction pays zero fees, it can only be
+	/// relayed/confirmed alongside a fee-paying child spending its P2WPKH output (TRUC 1P1C),
+	/// analogous to how zero-fee commitment transactions are fee-bumped via `ClaimEvent`. The
+	/// `OnchainTxHandler` currently broadcasts the parent on its own; emitting the CPFP child event
+	/// is the remaining integration work.
+	#[rustfmt::skip]
+	pub(crate) fn get_maybe_signed_htlcs_claim_tx<Signer: EcdsaChannelSigner>(
+		&self, onchain_handler: &mut OnchainTxHandler<Signer>, outpoint: &BitcoinOutPoint,
+	) -> Option<MaybeSignedTransaction> {
+		let channel_parameters = onchain_handler.channel_parameters();
+		let channel_parameters = self.channel_parameters.as_ref().unwrap_or(channel_parameters);
+		debug_assert!(channel_parameters.channel_type_features.supports_htlcs_claim_tx());
+		let directed_parameters = channel_parameters.as_counterparty_broadcastable();
+		let chan_keys = TxCreationKeys::from_channel_static_keys(
+			&self.per_commitment_point, directed_parameters.broadcaster_pubkeys(),
+			directed_parameters.countersignatory_pubkeys(), &onchain_handler.secp_ctx,
+		);
+		let countersignatory_payment_point =
+			&directed_parameters.countersignatory_pubkeys().payment_point;
+
+		let mut claim_tx = chan_utils::build_htlc_claim_transaction(
+			*outpoint, &self.htlc, countersignatory_payment_point,
+		);
+		let spend_info = chan_utils::offered_htlc_taproot_spend_info(
+			&self.htlc, &chan_keys.revocation_key, &chan_keys.broadcaster_htlc_key,
+			&chan_keys.countersignatory_htlc_key, countersignatory_payment_point,
+		);
+		let (_htlc_timeout, htlc_success) = chan_utils::offered_htlc_tapscript_leaves(
+			&self.htlc, &chan_keys.broadcaster_htlc_key, &chan_keys.countersignatory_htlc_key,
+			countersignatory_payment_point,
+		);
+		claim_tx.input[0].witness = chan_utils::build_htlcs_claim_tx_witness(
+			&self.preimage, &spend_info, &htlc_success,
+		);
+		Some(MaybeSignedTransaction(claim_tx))
+	}
 }
 
 impl Writeable for CounterpartyOfferedHTLCOutput {
@@ -941,6 +986,9 @@ impl PackageSolvingData {
 					directed_parameters.broadcaster_pubkeys().htlc_basepoint,
 					outp.counterparty_htlc_base_key,
 				);
+				// `option_htlcs_claim_tx` offered HTLC outputs are untractable (resolved by
+				// broadcasting the fixed HTLC claim transaction) and so are never finalized here.
+				debug_assert!(!channel_parameters.channel_type_features.supports_htlcs_claim_tx());
 				let chan_keys = TxCreationKeys::from_channel_static_keys(
 					&outp.per_commitment_point, directed_parameters.broadcaster_pubkeys(),
 					directed_parameters.countersignatory_pubkeys(), &onchain_handler.secp_ctx,
@@ -1000,6 +1048,11 @@ impl PackageSolvingData {
 			PackageSolvingData::HolderFundingOutput(ref outp) => {
 				Some(outp.get_maybe_signed_commitment_tx(onchain_handler))
 			}
+			PackageSolvingData::CounterpartyOfferedHTLCOutput(ref outp) => {
+				// Only `option_htlcs_claim_tx` offered HTLC outputs are untractable and reach here.
+				debug_assert!(outp.channel_type_features.supports_htlcs_claim_tx());
+				outp.get_maybe_signed_htlcs_claim_tx(onchain_handler, outpoint)
+			}
 			_ => { panic!("API Error!"); }
 		}
 	}
@@ -1043,8 +1096,16 @@ impl PackageSolvingData {
 					PackageMalleability::Malleable(AggregationCluster::Pinnable)
 				}
 			},
-			PackageSolvingData::CounterpartyOfferedHTLCOutput(..) =>
-				PackageMalleability::Malleable(AggregationCluster::Unpinnable),
+			PackageSolvingData::CounterpartyOfferedHTLCOutput(ref outp) => {
+				if outp.channel_type_features.supports_htlcs_claim_tx() {
+					// `option_htlcs_claim_tx`: the output is resolved by broadcasting a fixed,
+					// templated zero-fee claim transaction (fee-bumped by a child). It is committed
+					// to via `OP_TEMPLATEHASH` and so cannot be aggregated or RBF-bumped.
+					PackageMalleability::Untractable
+				} else {
+					PackageMalleability::Malleable(AggregationCluster::Unpinnable)
+				}
+			},
 			PackageSolvingData::CounterpartyReceivedHTLCOutput(..) =>
 				PackageMalleability::Malleable(AggregationCluster::Pinnable),
 			PackageSolvingData::HolderHTLCOutput(ref outp) => {

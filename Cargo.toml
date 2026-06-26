@@ -32,6 +32,12 @@ exclude = [
 # worth it. Note that we only apply optimizations to dependencies, not workspace
 # crates themselves.
 # https://doc.rust-lang.org/cargo/reference/profiles.html#profile-selection
+# Experimental `OP_TEMPLATEHASH` (BIP-446/448) support used by `option_htlcs_claim_tx` is not yet
+# available in a released `bitcoin`; pull it from a fork that adds it. The BIP-446/448 commits are
+# cherry-picked onto the same `bitcoin` patch release (0.32.101) that we otherwise depend on.
+[patch.crates-io]
+bitcoin = { git = "https://github.com/darosior/rust-bitcoin", branch = "bip448-0.32.4" }
+
 [profile.dev.package."*"]
 opt-level = 2
 

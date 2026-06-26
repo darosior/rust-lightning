@@ -15196,6 +15196,10 @@ pub(super) fn channel_type_from_open_channel(
 	if channel_type.requires_unknown_bits_from(&our_supported_features) {
 		return Err(ChannelError::close("Channel Type contains unsupported features".to_owned()));
 	}
+	// `option_htlcs_claim_tx` is only defined on top of `option_zero_fee_commitments`.
+	if channel_type.requires_htlcs_claim_tx() && !channel_type.requires_anchor_zero_fee_commitments() {
+		return Err(ChannelError::close("option_htlcs_claim_tx requires option_zero_fee_commitments".to_owned()));
+	}
 	let announce_for_forwarding = if (common_fields.channel_flags & 1) == 1 { true } else { false };
 	if channel_type.requires_scid_privacy() && announce_for_forwarding {
 		return Err(ChannelError::close("SCID Alias/Privacy Channel Type cannot be set on a public channel".to_owned()));
@@ -15833,6 +15837,13 @@ pub(super) fn get_initial_channel_type(
 		ret.set_anchor_zero_fee_commitments_required();
 		// `option_static_remote_key` is assumed by `option_zero_fee_commitments`.
 		ret.clear_static_remote_key();
+		// `option_htlcs_claim_tx` builds on top of `option_zero_fee_commitments`, so we can only
+		// negotiate it when the latter was selected.
+		if config.channel_handshake_config.negotiate_htlcs_claim_tx
+			&& their_features.supports_htlcs_claim_tx()
+		{
+			ret.set_htlcs_claim_tx_required();
+		}
 	} else if config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx
 		&& their_features.supports_anchors_zero_fee_htlc_tx()
 	{

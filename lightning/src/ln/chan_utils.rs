@@ -16,6 +16,7 @@ use bitcoin::opcodes;
 use bitcoin::script::{Builder, Script, ScriptBuf};
 use bitcoin::sighash;
 use bitcoin::sighash::EcdsaSighashType;
+use bitcoin::taproot::{LeafVersion, TaprootBuilder, TaprootSpendInfo};
 use bitcoin::transaction::Version;
 use bitcoin::transaction::{OutPoint, Transaction, TxIn, TxOut};
 use bitcoin::{PubkeyHash, WPubkeyHash};
@@ -828,6 +829,176 @@ pub(crate) fn get_htlc_redeemscript_with_explicit_keys(htlc: &HTLCOutputInCommit
 #[rustfmt::skip]
 pub fn get_htlc_redeemscript(htlc: &HTLCOutputInCommitment, channel_type_features: &ChannelTypeFeatures, keys: &TxCreationKeys) -> ScriptBuf {
 	get_htlc_redeemscript_with_explicit_keys(htlc, channel_type_features, &keys.broadcaster_htlc_key, &keys.countersignatory_htlc_key, &keys.revocation_key)
+}
+
+/// Computes the BIP-446 `OP_TEMPLATEHASH` digest for the given transaction and input index.
+///
+/// The template hash commits to the version, locktime, input sequences, outputs and the spending
+/// input index, but *not* to the prevouts, which is what avoids a commitment cycle. We do not use an
+/// annex here.
+///
+/// Because the prevouts are not committed to, the hash is independent of the commitment transaction
+/// that the HTLC claim transaction spends, so it can be computed while building the offered HTLC
+/// output (before the commitment txid is known).
+pub(crate) fn get_template_hash(tx: &Transaction, input_index: u32) -> [u8; 32] {
+	let mut cache = sighash::SighashCache::new(tx);
+	cache
+		.template_hash(input_index as usize, None)
+		.expect("input index is within bounds")
+		.to_byte_array()
+}
+
+/// Builds the v3 "HTLC claim transaction" used to resolve an offered HTLC output via the preimage
+/// path when `option_htlcs_claim_tx` applies.
+///
+/// The transaction spends a single offered HTLC output and pays its entire value (the HTLC
+/// `amount_msat` divided by 1000, rounding down) to a P2WPKH for the remote node's `payment_point`,
+/// paying zero fees (it is fee-bumped via a TRUC/v3 child).
+///
+/// `commitment_outpoint` is only relevant when broadcasting; [`get_template_hash`] does not commit
+/// to it, so [`OutPoint::null`] may be passed when computing the templated `htlc_success` script.
+pub fn build_htlc_claim_transaction(
+	commitment_outpoint: OutPoint, htlc: &HTLCOutputInCommitment,
+	countersignatory_payment_point: &PublicKey,
+) -> Transaction {
+	Transaction {
+		version: Version::non_standard(3),
+		lock_time: LockTime::ZERO,
+		input: vec![TxIn {
+			previous_output: commitment_outpoint,
+			script_sig: ScriptBuf::new(),
+			sequence: Sequence(0),
+			witness: Witness::new(),
+		}],
+		output: vec![TxOut {
+			value: htlc.to_bitcoin_amount(),
+			script_pubkey: ScriptBuf::new_p2wpkh(&WPubkeyHash::hash(
+				&countersignatory_payment_point.serialize(),
+			)),
+		}],
+	}
+}
+
+/// The two tapscript leaves of an offered HTLC output when `option_htlcs_claim_tx` applies: the
+/// `htlc_timeout` leaf (a 2-of-2 between the two HTLC keys) and the `htlc_success` leaf (which
+/// commits, via `OP_TEMPLATEHASH`, to the [HTLC claim transaction]).
+///
+/// [HTLC claim transaction]: build_htlc_claim_transaction
+pub(crate) fn offered_htlc_tapscript_leaves(
+	htlc: &HTLCOutputInCommitment, broadcaster_htlc_key: &HtlcKey,
+	countersignatory_htlc_key: &HtlcKey, countersignatory_payment_point: &PublicKey,
+) -> (ScriptBuf, ScriptBuf) {
+	// In tapscript, `OP_CHECKSIG` expects 32-byte x-only (BIP-340) keys.
+	let broadcaster_xonly = broadcaster_htlc_key.to_public_key().x_only_public_key().0.serialize();
+	let countersignatory_xonly =
+		countersignatory_htlc_key.to_public_key().x_only_public_key().0.serialize();
+
+	let htlc_timeout = Builder::new()
+		.push_slice(&broadcaster_xonly)
+		.push_opcode(opcodes::all::OP_CHECKSIGVERIFY)
+		.push_slice(&countersignatory_xonly)
+		.push_opcode(opcodes::all::OP_CHECKSIG)
+		.into_script();
+
+	let payment_hash160 = Ripemd160::hash(&htlc.payment_hash.0[..]).to_byte_array();
+	let claim_tx = build_htlc_claim_transaction(
+		OutPoint::null(),
+		htlc,
+		countersignatory_payment_point,
+	);
+	let claim_tx_hash = get_template_hash(&claim_tx, 0);
+	let htlc_success = Builder::new()
+		.push_opcode(opcodes::all::OP_SIZE)
+		.push_int(32)
+		.push_opcode(opcodes::all::OP_EQUALVERIFY)
+		.push_opcode(opcodes::all::OP_HASH160)
+		.push_slice(&payment_hash160)
+		.push_opcode(opcodes::all::OP_EQUALVERIFY)
+		.push_slice(&claim_tx_hash)
+		.push_opcode(opcodes::all::OP_TEMPLATEHASH)
+		.push_opcode(opcodes::all::OP_EQUAL)
+		.into_script();
+
+	(htlc_timeout, htlc_success)
+}
+
+/// The [`TaprootSpendInfo`] for an offered HTLC output when `option_htlcs_claim_tx` applies.
+///
+/// The output is a P2TR with the revocation key as the internal (key-path) key — allowing the
+/// counterparty to sweep a revoked commitment immediately — and a two-leaf script tree built from
+/// [`offered_htlc_tapscript_leaves`].
+pub(crate) fn offered_htlc_taproot_spend_info(
+	htlc: &HTLCOutputInCommitment, revocation_key: &RevocationKey, broadcaster_htlc_key: &HtlcKey,
+	countersignatory_htlc_key: &HtlcKey, countersignatory_payment_point: &PublicKey,
+) -> TaprootSpendInfo {
+	let (htlc_timeout, htlc_success) = offered_htlc_tapscript_leaves(
+		htlc,
+		broadcaster_htlc_key,
+		countersignatory_htlc_key,
+		countersignatory_payment_point,
+	);
+	let internal_key = revocation_key.to_public_key().x_only_public_key().0;
+	// A verification-only context is sufficient to compute the taproot output key (an EC point
+	// tweak). The two-leaf tree is statically valid so none of these calls can fail.
+	let secp = Secp256k1::verification_only();
+	let builder = TaprootBuilder::new()
+		.add_leaf(1, htlc_timeout)
+		.and_then(|builder| builder.add_leaf(1, htlc_success))
+		.expect("Adding two taproot leaves at depth 1 is always valid");
+	builder
+		.finalize(&secp, internal_key)
+		.unwrap_or_else(|_| unreachable!("a complete two-leaf taproot tree always finalizes"))
+}
+
+/// The `scriptPubKey` of an offered HTLC output when `option_htlcs_claim_tx` applies (a P2TR).
+pub(crate) fn get_offered_htlc_taproot_scriptpubkey(
+	htlc: &HTLCOutputInCommitment, revocation_key: &RevocationKey, broadcaster_htlc_key: &HtlcKey,
+	countersignatory_htlc_key: &HtlcKey, countersignatory_payment_point: &PublicKey,
+) -> ScriptBuf {
+	let spend_info = offered_htlc_taproot_spend_info(
+		htlc,
+		revocation_key,
+		broadcaster_htlc_key,
+		countersignatory_htlc_key,
+		countersignatory_payment_point,
+	);
+	ScriptBuf::new_p2tr_tweaked(spend_info.output_key())
+}
+
+/// The `scriptPubKey` placed in a commitment transaction for the given HTLC output, accounting for
+/// the `option_htlcs_claim_tx` taproot offered-HTLC variant.
+pub(crate) fn get_htlc_output_scriptpubkey(
+	htlc: &HTLCOutputInCommitment, channel_type_features: &ChannelTypeFeatures,
+	keys: &TxCreationKeys, countersignatory_payment_point: &PublicKey,
+) -> ScriptBuf {
+	if htlc.offered && channel_type_features.supports_htlcs_claim_tx() {
+		get_offered_htlc_taproot_scriptpubkey(
+			htlc,
+			&keys.revocation_key,
+			&keys.broadcaster_htlc_key,
+			&keys.countersignatory_htlc_key,
+			countersignatory_payment_point,
+		)
+	} else {
+		get_htlc_redeemscript(htlc, channel_type_features, keys).to_p2wsh()
+	}
+}
+
+/// The witness spending an offered HTLC output via the preimage (`htlc_success`) path when
+/// `option_htlcs_claim_tx` applies, used on the input of the [HTLC claim transaction].
+///
+/// [HTLC claim transaction]: build_htlc_claim_transaction
+pub(crate) fn build_htlcs_claim_tx_witness(
+	preimage: &PaymentPreimage, spend_info: &TaprootSpendInfo, htlc_success_script: &Script,
+) -> Witness {
+	let control_block = spend_info
+		.control_block(&(htlc_success_script.to_owned(), LeafVersion::TapScript))
+		.expect("htlc_success leaf is part of the taproot tree");
+	let mut witness = Witness::new();
+	witness.push(preimage.0.to_vec());
+	witness.push(htlc_success_script.to_bytes());
+	witness.push(control_block.serialize());
+	witness
 }
 
 /// Gets the redeemscript for a funding output from the two funding public keys.
@@ -1758,7 +1929,7 @@ impl CommitmentTransaction {
 		let (obscured_commitment_transaction_number, txins) = Self::build_inputs(self.commitment_number, channel_parameters);
 
 		// First rebuild the htlc outputs, note that `outputs` is now the same length as `self.nondust_htlcs`
-		let mut outputs = Self::build_htlc_outputs(keys, &self.nondust_htlcs, channel_parameters.channel_type_features());
+		let mut outputs = Self::build_htlc_outputs(keys, &self.nondust_htlcs, channel_parameters);
 
 		let nondust_htlcs_value_sum_sat = self.nondust_htlcs.iter().map(|htlc| htlc.to_bitcoin_amount()).sum();
 
@@ -1822,7 +1993,7 @@ impl CommitmentTransaction {
 	) -> Vec<TxOut> {
 		// First build and sort the HTLC outputs.
 		// Also sort the HTLC output data in `nondust_htlcs` in the same order.
-		let mut outputs = Self::build_sorted_htlc_outputs(keys, nondust_htlcs, channel_parameters.channel_type_features());
+		let mut outputs = Self::build_sorted_htlc_outputs(keys, nondust_htlcs, channel_parameters);
 
 		let nondust_htlcs_value_sum_sat = nondust_htlcs.iter().map(|htlc| htlc.to_bitcoin_amount()).sum();
 
@@ -1940,14 +2111,15 @@ impl CommitmentTransaction {
 	}
 
 	#[rustfmt::skip]
-	fn build_htlc_outputs(keys: &TxCreationKeys, nondust_htlcs: &Vec<HTLCOutputInCommitment>, channel_type: &ChannelTypeFeatures) -> Vec<TxOut> {
+	fn build_htlc_outputs(keys: &TxCreationKeys, nondust_htlcs: &Vec<HTLCOutputInCommitment>, channel_parameters: &DirectedChannelTransactionParameters) -> Vec<TxOut> {
 		// Allocate memory for the 4 possible non-htlc outputs
 		let mut txouts = Vec::with_capacity(nondust_htlcs.len() + 4);
 
+		let channel_type = channel_parameters.channel_type_features();
+		let countersignatory_payment_point = &channel_parameters.countersignatory_pubkeys().payment_point;
 		for htlc in nondust_htlcs {
-			let script = get_htlc_redeemscript(htlc, channel_type, keys);
 			let txout = TxOut {
-				script_pubkey: script.to_p2wsh(),
+				script_pubkey: get_htlc_output_scriptpubkey(htlc, channel_type, keys, countersignatory_payment_point),
 				value: htlc.to_bitcoin_amount(),
 			};
 			txouts.push(txout);
@@ -1960,10 +2132,10 @@ impl CommitmentTransaction {
 	fn build_sorted_htlc_outputs(
 		keys: &TxCreationKeys,
 		nondust_htlcs: &mut Vec<HTLCOutputInCommitment>,
-		channel_type: &ChannelTypeFeatures
+		channel_parameters: &DirectedChannelTransactionParameters
 	) -> Vec<TxOut> {
 		// Note that `txouts` has the same length as `nondust_htlcs` here
-		let mut txouts = Self::build_htlc_outputs(keys, nondust_htlcs, channel_type);
+		let mut txouts = Self::build_htlc_outputs(keys, nondust_htlcs, channel_parameters);
 
 		// Sort the HTLC outputs by value, then by script pubkey, then by cltv expiration height.
 		//
@@ -2982,5 +3154,100 @@ mod tests {
 		big_htlc.transaction_output_index = Some(1);
 
 		swap_htlcs!(small_htlc, big_htlc);
+	}
+
+	#[test]
+	fn test_htlcs_claim_tx() {
+		use super::{
+			build_htlc_claim_transaction, get_offered_htlc_taproot_scriptpubkey, get_template_hash,
+			offered_htlc_tapscript_leaves,
+		};
+		use super::{HtlcKey, RevocationKey};
+		use bitcoin::opcodes::all::{OP_EQUAL, OP_TEMPLATEHASH};
+		use bitcoin::transaction::Version;
+
+		let secp_ctx = Secp256k1::new();
+		let key = |b: u8| {
+			PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[b; 32]).unwrap())
+		};
+		let revocation_key = RevocationKey(key(1));
+		let broadcaster_htlc_key = HtlcKey(key(2));
+		let countersignatory_htlc_key = HtlcKey(key(3));
+		let countersignatory_payment_point = key(4);
+
+		let htlc = HTLCOutputInCommitment {
+			offered: true,
+			amount_msat: 1_234_567,
+			cltv_expiry: 500,
+			payment_hash: PaymentHash([0x42; 32]),
+			transaction_output_index: Some(0),
+		};
+
+		// The claim transaction is a zero-fee v3 transaction paying the full (rounded-down) HTLC
+		// value to a P2WPKH for the remote node's payment point.
+		let claim_tx = build_htlc_claim_transaction(
+			bitcoin::transaction::OutPoint::null(),
+			&htlc,
+			&countersignatory_payment_point,
+		);
+		assert_eq!(claim_tx.version, Version::non_standard(3));
+		assert_eq!(claim_tx.lock_time.to_consensus_u32(), 0);
+		assert_eq!(claim_tx.input.len(), 1);
+		assert_eq!(claim_tx.input[0].sequence.to_consensus_u32(), 0);
+		assert_eq!(claim_tx.output.len(), 1);
+		assert_eq!(claim_tx.output[0].value.to_sat(), htlc.amount_msat / 1000);
+		assert!(claim_tx.output[0].script_pubkey.is_p2wpkh());
+
+		// The template hash is deterministic and independent of the (un-committed) prevout, but
+		// depends on the committed output value.
+		let hash_a = get_template_hash(&claim_tx, 0);
+		let mut claim_tx_other_prevout = claim_tx.clone();
+		claim_tx_other_prevout.input[0].previous_output = bitcoin::transaction::OutPoint::new(
+			Txid::from_slice(&[0xab; 32]).unwrap(),
+			7,
+		);
+		assert_eq!(hash_a, get_template_hash(&claim_tx_other_prevout, 0));
+
+		let mut bigger_htlc = htlc.clone();
+		bigger_htlc.amount_msat += 1_000_000;
+		let bigger_claim_tx = build_htlc_claim_transaction(
+			bitcoin::transaction::OutPoint::null(),
+			&bigger_htlc,
+			&countersignatory_payment_point,
+		);
+		assert_ne!(hash_a, get_template_hash(&bigger_claim_tx, 0));
+
+		// The `htlc_success` leaf commits to that template hash via `OP_TEMPLATEHASH`, and the
+		// `htlc_timeout` leaf is a 2-of-2 of the two HTLC keys.
+		let (htlc_timeout, htlc_success) = offered_htlc_tapscript_leaves(
+			&htlc,
+			&broadcaster_htlc_key,
+			&countersignatory_htlc_key,
+			&countersignatory_payment_point,
+		);
+		let success_bytes = htlc_success.as_bytes();
+		// The leaf ends with `<32-byte template hash> OP_TEMPLATEHASH OP_EQUAL`.
+		assert_eq!(*success_bytes.last().unwrap(), OP_EQUAL.to_u8());
+		assert_eq!(success_bytes[success_bytes.len() - 2], OP_TEMPLATEHASH.to_u8());
+		assert!(success_bytes
+			.windows(hash_a.len())
+			.any(|w| w == &hash_a[..]));
+		// `<32-byte key> OP_CHECKSIGVERIFY <32-byte key> OP_CHECKSIG`:
+		// (1 + 32) + 1 + (1 + 32) + 1 = 68 bytes.
+		assert_eq!(htlc_timeout.as_bytes().len(), 68);
+		assert_eq!(
+			*htlc_timeout.as_bytes().last().unwrap(),
+			bitcoin::opcodes::all::OP_CHECKSIG.to_u8()
+		);
+
+		// The commitment output is a P2TR.
+		let spk = get_offered_htlc_taproot_scriptpubkey(
+			&htlc,
+			&revocation_key,
+			&broadcaster_htlc_key,
+			&countersignatory_htlc_key,
+			&countersignatory_payment_point,
+		);
+		assert!(spk.is_p2tr());
 	}
 }

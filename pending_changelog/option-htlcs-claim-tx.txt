@@ -1,0 +1,20 @@
+# API Updates
+
+ * Added experimental support for the `option_htlcs_claim_tx` channel type (feature bits
+   110/111), which builds on `option_zero_fee_commitments` to close the last on-chain pinning
+   gap. Offered HTLC outputs become P2TR outputs whose preimage (`htlc_success`) spend path
+   commits, via `OP_TEMPLATEHASH` (BIP-446/448), to a fixed v3 "HTLC claim transaction". Enable it
+   by setting `ChannelHandshakeConfig::negotiate_htlcs_claim_tx` (requires
+   `negotiate_anchor_zero_fee_commitments`).
+
+   This feature is experimental and incomplete:
+   * `OP_TEMPLATEHASH` is not in a released `bitcoin`, so this relies on a `[patch.crates-io]`
+     entry pointing at a fork that adds the BIP-446/448 opcode and the BIP-446 `template_hash`
+     digest on top of the `bitcoin` patch release we otherwise use. Both the opcode and the
+     underlying soft fork are still subject to change.
+   * On-chain resolution of an offered HTLC via the preimage path now broadcasts the fixed,
+     templated v3 claim transaction (a single zero-fee P2WPKH output for the full HTLC value) as an
+     untractable, non-aggregated package, rather than a custom malleable sweep. Because the claim
+     transaction is zero-fee, it still requires a fee-paying child (TRUC 1P1C) to relay/confirm;
+     emitting that CPFP child via `ClaimEvent`, analogous to zero-fee commitment transactions, is
+     not yet wired up. Do not enable on mainnet.

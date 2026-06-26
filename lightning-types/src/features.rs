@@ -83,6 +83,8 @@
 //!   (see [BOLT PR #1160](https://github.com/lightning/bolts/pull/1160) for more information).
 //! - `HtlcHold` - requires/supports holding HTLCs and forwarding on receipt of an onion message
 //!   (see [BOLT-2](https://github.com/lightning/bolts/pull/989/files) for more information).
+//! - `OptionHTLCsClaimTx` - requires/supports committing to a v3 claim transaction in the preimage
+//!   spend path of offered HTLC outputs, closing the last pinning gap (experimental).
 //!
 //! LDK knows about the following features, but does not support them:
 //! - `AnchorsNonzeroFeeHtlcTx` - the initial version of anchor outputs, which was later found to be
@@ -167,8 +169,12 @@ mod sealed {
 			ZeroConf,
 			// Byte 7
 			Trampoline | SimpleClose | Splice,
-			// Byte 8 - 18
-			,,,,,,,,,,,
+			// Byte 8 - 12
+			,,,,,
+			// Byte 13
+			OptionHTLCsClaimTx,
+			// Byte 14 - 18
+			,,,,,
 			// Byte 19
 			HtlcHold,
 		]
@@ -192,8 +198,12 @@ mod sealed {
 			ZeroConf | Keysend,
 			// Byte 7
 			Trampoline | SimpleClose | Splice,
-			// Byte 8 - 18
-			,,,,,,,,,,,
+			// Byte 8 - 12
+			,,,,,
+			// Byte 13
+			OptionHTLCsClaimTx,
+			// Byte 14 - 18
+			,,,,,
 			// Byte 19
 			HtlcHold,
 			// Byte 20 - 31
@@ -259,6 +269,10 @@ mod sealed {
 		AnchorZeroFeeCommitments | SCIDPrivacy,
 		// Byte 6
 		ZeroConf,
+		// Byte 7 - 12
+		,,,,,,
+		// Byte 13
+		OptionHTLCsClaimTx,
 	]);
 
 	/// Defines a feature with the given bits for the specified [`Context`]s. The generated trait is
@@ -706,6 +720,17 @@ mod sealed {
 	// By default, allocate enough bytes to cover up to Splice. Update this as new features are
 	// added which we expect to appear commonly across contexts.
 	pub(super) const MIN_FEATURES_ALLOCATION_BYTES: usize = 63_usize.div_ceil(8);
+	define_feature!(
+		111,
+		OptionHTLCsClaimTx,
+		[InitContext, NodeContext, ChannelTypeContext],
+		"Feature flags for `option_htlcs_claim_tx`.",
+		set_htlcs_claim_tx_optional,
+		set_htlcs_claim_tx_required,
+		clear_htlcs_claim_tx,
+		supports_htlcs_claim_tx,
+		requires_htlcs_claim_tx
+	);
 	define_feature!(
 		153, // The BOLTs PR uses feature bit 52/53, so add +100 for the experimental bit
 		HtlcHold,
