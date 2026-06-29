@@ -16,6 +16,7 @@ use crate::ln::channel_keys::HtlcKey;
 use crate::ln::msgs;
 use crate::sign::ecdsa::EcdsaChannelSigner;
 use crate::sign::ChannelSigner;
+use crate::sign::StaticPaymentOutputDescriptor;
 use crate::types::payment::PaymentPreimage;
 
 #[allow(unused_imports)]
@@ -32,7 +33,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::sighash;
 use bitcoin::sighash::EcdsaSighashType;
 use bitcoin::transaction::Transaction;
-use bitcoin::Txid;
+use bitcoin::{Txid, Witness};
 
 use crate::sign::HTLCDescriptor;
 use crate::util::dyn_signer::DynSigner;
@@ -497,6 +498,13 @@ impl EcdsaChannelSigner for TestChannelSigner {
 			return Err(());
 		}
 		self.inner.sign_holder_keyed_anchor_input(chan_params, anchor_tx, input, secp_ctx)
+	}
+
+	fn sign_htlcs_claim_transaction_input(
+		&self, claim_child_tx: &Transaction, input: usize,
+		descriptor: &StaticPaymentOutputDescriptor, secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<Witness, ()> {
+		self.inner.sign_htlcs_claim_transaction_input(claim_child_tx, input, descriptor, secp_ctx)
 	}
 
 	fn sign_channel_announcement_with_funding_key(

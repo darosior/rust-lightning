@@ -1,6 +1,7 @@
 //! Defines ECDSA-specific signer types.
 
 use bitcoin::transaction::Transaction;
+use bitcoin::Witness;
 
 use bitcoin::secp256k1;
 use bitcoin::secp256k1::ecdsa::Signature;
@@ -16,7 +17,7 @@ use crate::types::payment::PaymentPreimage;
 #[allow(unused_imports)]
 use crate::prelude::*;
 
-use crate::sign::{ChannelSigner, HTLCDescriptor};
+use crate::sign::{ChannelSigner, HTLCDescriptor, StaticPaymentOutputDescriptor};
 
 /// A trait to sign Lightning channel transactions as described in
 /// [BOLT 3](https://github.com/lightning/bolts/blob/master/03-transactions.md).
@@ -227,6 +228,25 @@ pub trait EcdsaChannelSigner: ChannelSigner {
 		&self, channel_parameters: &ChannelTransactionParameters, anchor_tx: &Transaction,
 		input: usize, secp_ctx: &Secp256k1<secp256k1::All>,
 	) -> Result<Signature, ()>;
+	/// Computes the full witness for the input of a fee-bumping child transaction that spends the
+	/// single P2WPKH output of an `option_htlcs_claim_tx` HTLC claim transaction, at index `input`.
+	///
+	/// The HTLC claim transaction pays the HTLC value to our payment point and is zero-fee, so to be
+	/// relayed and confirmed it must be broadcast together with a fee-paying child as a TRUC
+	/// 1-parent-1-child package. `descriptor` describes the claim transaction output being spent by
+	/// the child here, which takes the form of a P2WPKH to our payment point.
+	///
+	/// An `Err` can be returned to signal that the signer is unavailable/cannot produce a valid
+	/// signature and should be retried later. Once the signer is ready to provide a signature after
+	/// previously returning an `Err`, [`ChannelMonitor::signer_unblocked`] must be called on its
+	/// monitor or [`ChainMonitor::signer_unblocked`] called to attempt unblocking all monitors.
+	///
+	/// [`ChannelMonitor::signer_unblocked`]: crate::chain::channelmonitor::ChannelMonitor::signer_unblocked
+	/// [`ChainMonitor::signer_unblocked`]: crate::chain::chainmonitor::ChainMonitor::signer_unblocked
+	fn sign_htlcs_claim_transaction_input(
+		&self, claim_child_tx: &Transaction, input: usize,
+		descriptor: &StaticPaymentOutputDescriptor, secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<Witness, ()>;
 	/// Signs a channel announcement message with our funding key proving it comes from one of the
 	/// channel participants.
 	///

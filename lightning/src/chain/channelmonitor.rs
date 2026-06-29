@@ -4648,6 +4648,30 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 						tx_lock_time,
 					}));
 				}
+				ClaimEvent::BumpHTLCsClaimTx {
+					target_feerate_sat_per_1000_weight, claim_tx, channel_parameters,
+				} => {
+					let channel_id = self.channel_id;
+					let counterparty_node_id = self.counterparty_node_id;
+					let channel_value_satoshis = channel_parameters.channel_value_satoshis;
+					// The claim transaction's single output (a P2WPKH to our payment point) is what
+					// the fee-paying child spends to bump the package fee.
+					let claim_output_descriptor = StaticPaymentOutputDescriptor {
+						outpoint: OutPoint { txid: claim_tx.compute_txid(), index: 0 },
+						output: claim_tx.output[0].clone(),
+						channel_keys_id: self.channel_keys_id,
+						channel_value_satoshis,
+						channel_transaction_parameters: Some(channel_parameters),
+					};
+					ret.push(Event::BumpTransaction(BumpTransactionEvent::HTLCsClaimTxResolution {
+						channel_id,
+						counterparty_node_id,
+						claim_id,
+						package_target_feerate_sat_per_1000_weight: target_feerate_sat_per_1000_weight,
+						claim_tx,
+						claim_output_descriptor,
+					}));
+				}
 			}
 		}
 		ret

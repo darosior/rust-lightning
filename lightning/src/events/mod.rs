@@ -2388,10 +2388,11 @@ impl Writeable for Event {
 			&Event::BumpTransaction(ref event) => {
 				27u8.write(writer)?;
 				match event {
-					// We never write the ChannelClose|HTLCResolution events as they'll be replayed
-					// upon restarting anyway if they remain unresolved.
+					// We never write the ChannelClose|HTLCResolution|HTLCsClaimTxResolution events
+					// as they'll be replayed upon restarting anyway if they remain unresolved.
 					BumpTransactionEvent::ChannelClose { .. } => {},
 					BumpTransactionEvent::HTLCResolution { .. } => {},
+					BumpTransactionEvent::HTLCsClaimTxResolution { .. } => {},
 				}
 				write_tlv_fields!(writer, {}); // Write a length field for forwards compat
 			},

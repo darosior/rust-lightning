@@ -15,6 +15,10 @@
    * On-chain resolution of an offered HTLC via the preimage path now broadcasts the fixed,
      templated v3 claim transaction (a single zero-fee P2WPKH output for the full HTLC value) as an
      untractable, non-aggregated package, rather than a custom malleable sweep. Because the claim
-     transaction is zero-fee, it still requires a fee-paying child (TRUC 1P1C) to relay/confirm;
-     emitting that CPFP child via `ClaimEvent`, analogous to zero-fee commitment transactions, is
-     not yet wired up. Do not enable on mainnet.
+     transaction is zero-fee, it is surfaced via the new
+     `BumpTransactionEvent::HTLCsClaimTxResolution` so the user can attach a fee-paying child
+     spending its output (a TRUC 1-parent-1-child package), analogous to how zero-fee commitment
+     transactions are fee-bumped. The new `EcdsaChannelSigner::sign_htlcs_claim_transaction_input`
+     signs the child's input spending the claim transaction output. The default
+     `BumpTransactionEventHandler` constructs, signs, and broadcasts the package automatically. Do
+     not enable on mainnet.

@@ -901,11 +901,8 @@ pub(crate) fn offered_htlc_tapscript_leaves(
 		.into_script();
 
 	let payment_hash160 = Ripemd160::hash(&htlc.payment_hash.0[..]).to_byte_array();
-	let claim_tx = build_htlc_claim_transaction(
-		OutPoint::null(),
-		htlc,
-		countersignatory_payment_point,
-	);
+	let claim_tx =
+		build_htlc_claim_transaction(OutPoint::null(), htlc, countersignatory_payment_point);
 	let claim_tx_hash = get_template_hash(&claim_tx, 0);
 	let htlc_success = Builder::new()
 		.push_opcode(opcodes::all::OP_SIZE)
@@ -3202,10 +3199,8 @@ mod tests {
 		// depends on the committed output value.
 		let hash_a = get_template_hash(&claim_tx, 0);
 		let mut claim_tx_other_prevout = claim_tx.clone();
-		claim_tx_other_prevout.input[0].previous_output = bitcoin::transaction::OutPoint::new(
-			Txid::from_slice(&[0xab; 32]).unwrap(),
-			7,
-		);
+		claim_tx_other_prevout.input[0].previous_output =
+			bitcoin::transaction::OutPoint::new(Txid::from_slice(&[0xab; 32]).unwrap(), 7);
 		assert_eq!(hash_a, get_template_hash(&claim_tx_other_prevout, 0));
 
 		let mut bigger_htlc = htlc.clone();
@@ -3229,9 +3224,7 @@ mod tests {
 		// The leaf ends with `<32-byte template hash> OP_TEMPLATEHASH OP_EQUAL`.
 		assert_eq!(*success_bytes.last().unwrap(), OP_EQUAL.to_u8());
 		assert_eq!(success_bytes[success_bytes.len() - 2], OP_TEMPLATEHASH.to_u8());
-		assert!(success_bytes
-			.windows(hash_a.len())
-			.any(|w| w == &hash_a[..]));
+		assert!(success_bytes.windows(hash_a.len()).any(|w| w == &hash_a[..]));
 		// `<32-byte key> OP_CHECKSIGVERIFY <32-byte key> OP_CHECKSIG`:
 		// (1 + 32) + 1 + (1 + 32) + 1 = 68 bytes.
 		assert_eq!(htlc_timeout.as_bytes().len(), 68);

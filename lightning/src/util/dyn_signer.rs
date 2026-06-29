@@ -17,11 +17,12 @@ use crate::sign::{ChannelSigner, ReceiveAuthKey};
 use crate::sign::{EntropySource, HTLCDescriptor, OutputSpender, PhantomKeysManager};
 use crate::sign::{
 	NodeSigner, PeerStorageKey, Recipient, SignerProvider, SpendableOutputDescriptor,
+	StaticPaymentOutputDescriptor,
 };
 use bitcoin;
 use bitcoin::absolute::LockTime;
 use bitcoin::secp256k1::All;
-use bitcoin::{secp256k1, ScriptBuf, Transaction, TxOut, Txid};
+use bitcoin::{secp256k1, ScriptBuf, Transaction, TxOut, Txid, Witness};
 use lightning_invoice::RawBolt11Invoice;
 use secp256k1::ecdsa::RecoverableSignature;
 use secp256k1::{ecdh::SharedSecret, ecdsa::Signature, PublicKey, Scalar, Secp256k1, SecretKey};
@@ -90,7 +91,10 @@ delegate!(DynSigner, EcdsaChannelSigner, inner,
 	fn sign_holder_htlc_transaction(, htlc_tx: &Transaction, input: usize,
 		htlc_descriptor: &HTLCDescriptor, secp_ctx: &Secp256k1<All>) -> Result<Signature, ()>,
 	fn sign_splice_shared_input(, channel_parameters: &ChannelTransactionParameters,
-		tx: &Transaction, input_index: usize, secp_ctx: &Secp256k1<All>) -> Result<Signature, ()>
+		tx: &Transaction, input_index: usize, secp_ctx: &Secp256k1<All>) -> Result<Signature, ()>,
+	fn sign_htlcs_claim_transaction_input(, claim_child_tx: &Transaction, input: usize,
+		descriptor: &StaticPaymentOutputDescriptor,
+		secp_ctx: &Secp256k1<secp256k1::All>) -> Result<Witness, ()>
 );
 
 delegate!(DynSigner, ChannelSigner,

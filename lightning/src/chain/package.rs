@@ -98,6 +98,7 @@ pub(crate) fn verify_channel_type_features(channel_type_features: &Option<Channe
 		supported_feature_set.set_scid_privacy_required();
 		supported_feature_set.set_zero_conf_required();
 		supported_feature_set.set_anchor_zero_fee_commitments_required();
+		supported_feature_set.set_htlcs_claim_tx_required();
 
 		// allow the passing of an additional necessary permitted flag
 		if let Some(additional_permitted_features) = additional_permitted_features {
@@ -294,6 +295,17 @@ impl CounterpartyOfferedHTLCOutput {
 		}
 	}
 
+	/// The channel type features of the channel this offered HTLC output belongs to.
+	pub(crate) fn channel_type_features(&self) -> &ChannelTypeFeatures {
+		&self.channel_type_features
+	}
+
+	/// The channel parameters of the channel this offered HTLC output belongs to, if known. May be
+	/// `None` for outputs deserialized from monitors written before LDK 0.2.
+	pub(crate) fn channel_parameters(&self) -> Option<&ChannelTransactionParameters> {
+		self.channel_parameters.as_ref()
+	}
+
 	/// Builds the templated v3 HTLC claim transaction spending this offered HTLC output via the
 	/// preimage (`htlc_success`) path, as required by `option_htlcs_claim_tx`.
 	///
@@ -302,11 +314,11 @@ impl CounterpartyOfferedHTLCOutput {
 	/// value), broadcast verbatim, and committed to via `OP_TEMPLATEHASH`. It carries no
 	/// counterparty signature: satisfaction is the preimage plus the leaf script.
 	///
-	/// TODO(option_htlcs_claim_tx): because the claim transaction pays zero fees, it can only be
-	/// relayed/confirmed alongside a fee-paying child spending its P2WPKH output (TRUC 1P1C),
-	/// analogous to how zero-fee commitment transactions are fee-bumped via `ClaimEvent`. The
-	/// `OnchainTxHandler` currently broadcasts the parent on its own; emitting the CPFP child event
-	/// is the remaining integration work.
+	/// Because the claim transaction pays zero fees, it can only be relayed and confirmed alongside
+	/// a fee-paying child spending its P2WPKH output (a TRUC 1-parent-1-child package). The
+	/// `OnchainTxHandler` therefore yields it as a `ClaimEvent::BumpHTLCsClaimTx` (surfaced to the
+	/// user as a `BumpTransactionEvent::HTLCsClaimTxResolution`) rather than broadcasting it on its
+	/// own.
 	#[rustfmt::skip]
 	pub(crate) fn get_maybe_signed_htlcs_claim_tx<Signer: EcdsaChannelSigner>(
 		&self, onchain_handler: &mut OnchainTxHandler<Signer>, outpoint: &BitcoinOutPoint,
@@ -1641,6 +1653,11 @@ impl PackageTemplate {
 			PackageSolvingData::HolderHTLCOutput(ref outp) => {
 				outp.channel_type_features.supports_anchors_zero_fee_htlc_tx()
 					|| outp.channel_type_features.supports_anchor_zero_fee_commitments()
+			},
+			PackageSolvingData::CounterpartyOfferedHTLCOutput(ref outp) => {
+				// `option_htlcs_claim_tx` offered HTLC outputs are resolved by broadcasting a
+				// fixed, zero-fee claim transaction that must be fee-bumped via a child (CPFP).
+				outp.channel_type_features.supports_htlcs_claim_tx()
 			},
 			_ => false,
 		}).is_some()

@@ -1915,6 +1915,15 @@ impl EcdsaChannelSigner for InMemorySigner {
 		Ok(sign_with_aux_rand(secp_ctx, &hash_to_message!(&sighash[..]), &funding_key, &self))
 	}
 
+	fn sign_htlcs_claim_transaction_input(
+		&self, claim_child_tx: &Transaction, input: usize,
+		descriptor: &StaticPaymentOutputDescriptor, secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<Witness, ()> {
+		// The claim transaction output is a plain P2WPKH to our payment point, exactly like a
+		// `to_remote`/static-payment output, so we can reuse the same signing path.
+		self.sign_counterparty_payment_input(claim_child_tx, input, descriptor, secp_ctx)
+	}
+
 	fn sign_channel_announcement_with_funding_key(
 		&self, channel_parameters: &ChannelTransactionParameters,
 		msg: &UnsignedChannelAnnouncement, secp_ctx: &Secp256k1<secp256k1::All>,

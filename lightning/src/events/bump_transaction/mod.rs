@@ -29,7 +29,10 @@ use crate::ln::chan_utils::{
 use crate::ln::types::ChannelId;
 use crate::prelude::*;
 use crate::sign::ecdsa::EcdsaChannelSigner;
-use crate::sign::{ChannelDerivationParameters, HTLCDescriptor, SignerProvider};
+use crate::sign::{
+	ChannelDerivationParameters, HTLCDescriptor, SignerProvider, StaticPaymentOutputDescriptor,
+	P2WPKH_WITNESS_WEIGHT,
+};
 use crate::util::logger::Logger;
 use crate::util::wallet_utils::{CoinSelection, CoinSelectionSource, ConfirmedUtxo, Input};
 
@@ -241,6 +244,53 @@ pub enum BumpTransactionEvent {
 		htlc_descriptors: Vec<HTLCDescriptor>,
 		/// The locktime required for the resulting HTLC transaction.
 		tx_lock_time: LockTime,
+	},
+	/// Indicates that an offered HTLC on a confirmed counterparty commitment of an
+	/// `option_htlcs_claim_tx` channel must be resolved via the preimage path by broadcasting the
+	/// fixed, template-committed HTLC claim transaction. Because that claim transaction commits to
+	/// itself through `OP_TEMPLATEHASH`, it cannot have inputs or outputs added to it, and because
+	/// it pays zero fees it must be confirmed alongside a fee-paying child spending its output as a
+	/// TRUC (BIP 431) 1-parent-1-child package. The child transaction must be version 3 and no more
+	/// than 1000 vB.
+	///
+	/// The `claim_tx` is fully signed and must be broadcast as-is. The consumer of this event must
+	/// construct the child transaction so that it spends `claim_output_descriptor` (the claim
+	/// transaction's single output, a P2WPKH to our payment point) along with any additional
+	/// confirmed inputs needed to meet `package_target_feerate_sat_per_1000_weight` over the whole
+	/// package, and then broadcast both transactions together (usually via the Bitcoin Core
+	/// `submitpackage` RPC). To sign the input spending `claim_output_descriptor`, an
+	/// [`EcdsaChannelSigner`] should be re-derived through [`SignerProvider::derive_channel_signer`]
+	/// and [`EcdsaChannelSigner::sign_htlcs_claim_transaction_input`] used to obtain the witness.
+	///
+	/// It is possible to receive more than one instance of this event if a valid child transaction
+	/// is never broadcast or is but not with a sufficient fee to be mined. Care should be taken to
+	/// ensure any future iterations of the child transaction adhere to the [Replace-By-Fee
+	/// rules](https://github.com/bitcoin/bitcoin/blob/master/doc/policy/mempool-replacements.md).
+	///
+	/// [`EcdsaChannelSigner`]: crate::sign::ecdsa::EcdsaChannelSigner
+	/// [`EcdsaChannelSigner::sign_htlcs_claim_transaction_input`]: crate::sign::ecdsa::EcdsaChannelSigner::sign_htlcs_claim_transaction_input
+	HTLCsClaimTxResolution {
+		/// The `channel_id` of the channel which has been closed.
+		channel_id: ChannelId,
+		/// Counterparty in the closed channel.
+		counterparty_node_id: PublicKey,
+		/// The unique identifier for the claim of the offered HTLC in the confirmed commitment
+		/// transaction.
+		///
+		/// The identifier must map to the set of external UTXOs assigned to the claim, such that
+		/// they can be reused when a new claim with the same identifier needs to be made, resulting
+		/// in a fee-bumping attempt.
+		claim_id: ClaimId,
+		/// The target feerate that the transaction package, which consists of the HTLC claim
+		/// transaction and the to-be-crafted fee-paying child transaction, must meet.
+		package_target_feerate_sat_per_1000_weight: u32,
+		/// The fully-signed, template-committed, zero-fee version 3 HTLC claim transaction. This
+		/// transaction must be broadcast as-is, together with the fee-paying child constructed as a
+		/// result of consuming this event.
+		claim_tx: Transaction,
+		/// The descriptor for the HTLC claim transaction's single output, spent by the fee-paying
+		/// child to anchor the CPFP fee bump.
+		claim_output_descriptor: StaticPaymentOutputDescriptor,
 	},
 }
 
@@ -778,6 +828,146 @@ impl<B: BroadcasterInterface, C: CoinSelectionSource, SP: SignerProvider, L: Log
 		Ok(())
 	}
 
+	/// Handles a [`BumpTransactionEvent::HTLCsClaimTxResolution`] event variant by producing a
+	/// fully-signed version 3 child transaction that spends the HTLC claim transaction's output to
+	/// bump its fee, and broadcasts both as a TRUC 1-parent-1-child package.
+	async fn handle_htlcs_claim_tx_resolution(
+		&self, channel_id: ChannelId, counterparty_node_id: PublicKey, claim_id: ClaimId,
+		package_target_feerate_sat_per_1000_weight: u32, claim_tx: &Transaction,
+		claim_output_descriptor: &StaticPaymentOutputDescriptor,
+	) -> Result<(), ()> {
+		// The HTLC claim transaction is template-committed (a single input and a single output) and
+		// pays zero fees, so it cannot be modified; instead we attach a fee-paying child spending
+		// its output, forming a TRUC (BIP 431) 1-parent-1-child package.
+		let claim_output = claim_output_descriptor.output.clone();
+		let claim_tx_weight = claim_tx.weight().to_wu();
+
+		// We fold the (zero-fee) claim transaction's weight into the child's spent claim output, so
+		// that coin selection meets the package feerate over both transactions.
+		let starting_input_satisfaction_weight =
+			claim_tx_weight + P2WPKH_WITNESS_WEIGHT + EMPTY_SCRIPT_SIG_WEIGHT;
+		let mut input_satisfaction_weight_with_parent = starting_input_satisfaction_weight;
+
+		loop {
+			let must_spend = vec![Input {
+				outpoint: claim_output_descriptor.outpoint.into_bitcoin_outpoint(),
+				previous_utxo: claim_output.clone(),
+				satisfaction_weight: input_satisfaction_weight_with_parent,
+			}];
+			let must_spend_amount = claim_output.value;
+
+			log_debug!(self.logger, "Performing coin selection for HTLC claim package (claim and child transaction) targeting {} sat/kW",
+				package_target_feerate_sat_per_1000_weight);
+			let coin_selection: CoinSelection = self
+				.utxo_source
+				.select_confirmed_utxos(
+					Some(claim_id),
+					must_spend,
+					&[],
+					package_target_feerate_sat_per_1000_weight,
+					// We added the claim tx weight to the input satisfaction weight above, so
+					// increase the max_tx_weight by the same delta here.
+					TRUC_CHILD_MAX_WEIGHT + claim_tx_weight,
+				)
+				.await?;
+
+			let mut child_tx = Transaction {
+				version: Version::non_standard(3),
+				lock_time: LockTime::ZERO, // TODO: Use next best height.
+				input: vec![TxIn {
+					previous_output: claim_output_descriptor.outpoint.into_bitcoin_outpoint(),
+					script_sig: ScriptBuf::new(),
+					sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+					witness: Witness::new(),
+				}],
+				output: vec![],
+			};
+
+			let input_satisfaction_weight = coin_selection.satisfaction_weight();
+			let total_satisfaction_weight =
+				P2WPKH_WITNESS_WEIGHT + EMPTY_SCRIPT_SIG_WEIGHT + input_satisfaction_weight;
+			let total_input_amount = must_spend_amount + coin_selection.input_amount();
+
+			self.process_coin_selection(&mut child_tx, &coin_selection);
+			let child_txid = child_tx.compute_txid();
+
+			// construct psbt
+			let mut child_psbt = Psbt::from_unsigned_tx(child_tx).unwrap();
+			// add witness_utxo to the claim output input
+			child_psbt.inputs[0].witness_utxo = Some(claim_output.clone());
+			// add witness_utxo to remaining inputs
+			for (idx, utxo) in coin_selection.confirmed_utxos.into_iter().enumerate() {
+				// add 1 to skip the claim output input
+				let index = idx + 1;
+				debug_assert_eq!(
+					child_psbt.unsigned_tx.input[index].previous_output,
+					utxo.outpoint()
+				);
+				if utxo.output().script_pubkey.is_witness_program() {
+					child_psbt.inputs[index].witness_utxo = Some(utxo.into_output());
+				}
+			}
+
+			debug_assert_eq!(child_psbt.unsigned_tx.output.len(), 1);
+			let unsigned_tx_weight = child_psbt.unsigned_tx.weight().to_wu()
+				- (child_psbt.unsigned_tx.input.len() as u64 * EMPTY_SCRIPT_SIG_WEIGHT);
+
+			let package_fee = total_input_amount
+				- child_psbt.unsigned_tx.output.iter().map(|output| output.value).sum();
+			let package_weight = unsigned_tx_weight + 2 /* wit marker */ + total_satisfaction_weight + claim_tx_weight;
+			if package_fee.to_sat() * 1000 / package_weight
+				< package_target_feerate_sat_per_1000_weight.into()
+			{
+				// On the first iteration of the loop, we may undershoot the target feerate because
+				// we had to add an OP_RETURN output in `process_coin_selection` which we didn't
+				// select sufficient coins for. Here we detect that case and go around again seeking
+				// additional weight.
+				if input_satisfaction_weight_with_parent == starting_input_satisfaction_weight {
+					debug_assert!(
+						child_psbt.unsigned_tx.output[0].script_pubkey.is_op_return(),
+						"Coin selection failed to select sufficient coins for its change output"
+					);
+					input_satisfaction_weight_with_parent +=
+						child_psbt.unsigned_tx.output[0].weight().to_wu();
+					continue;
+				} else {
+					debug_assert!(false, "Coin selection failed to select sufficient coins");
+				}
+			}
+
+			log_debug!(self.logger, "Signing HTLC claim child transaction {}", child_txid);
+			let mut child_tx = self.utxo_source.sign_psbt(child_psbt).await?;
+
+			// Sign the input spending the claim transaction's output via the channel signer.
+			let signer =
+				self.signer_provider.derive_channel_signer(claim_output_descriptor.channel_keys_id);
+			child_tx.input[0].witness = signer.sign_htlcs_claim_transaction_input(
+				&child_tx,
+				0,
+				claim_output_descriptor,
+				&self.secp,
+			)?;
+
+			#[cfg(debug_assertions)]
+			{
+				assert!(claim_tx_weight < TRUC_MAX_WEIGHT);
+				assert!(child_tx.weight().to_wu() < TRUC_CHILD_MAX_WEIGHT);
+			}
+
+			log_info!(
+				self.logger,
+				"Broadcasting HTLC claim transaction {} with fee-bumping child {}",
+				claim_tx.compute_txid(),
+				child_txid
+			);
+			self.broadcaster.broadcast_transactions(&[
+				(claim_tx, TransactionType::Claim { counterparty_node_id, channel_id }),
+				(&child_tx, TransactionType::AnchorBump { counterparty_node_id, channel_id }),
+			]);
+			return Ok(());
+		}
+	}
+
 	/// Handles all variants of [`BumpTransactionEvent`].
 	pub async fn handle_event(&self, event: &BumpTransactionEvent) {
 		match event {
@@ -844,6 +1034,37 @@ impl<B: BroadcasterInterface, C: CoinSelectionSource, SP: SignerProvider, L: Log
 						self.logger,
 						"Failed bumping HTLC transaction fee for commitment {}",
 						htlc_descriptors[0].commitment_txid
+					);
+				});
+			},
+			BumpTransactionEvent::HTLCsClaimTxResolution {
+				channel_id,
+				counterparty_node_id,
+				claim_id,
+				package_target_feerate_sat_per_1000_weight,
+				claim_tx,
+				claim_output_descriptor,
+			} => {
+				log_info!(
+					self.logger,
+					"Handling HTLC claim transaction bump (claim_id = {}, claim_txid = {})",
+					log_bytes!(claim_id.0),
+					claim_tx.compute_txid()
+				);
+				self.handle_htlcs_claim_tx_resolution(
+					*channel_id,
+					*counterparty_node_id,
+					*claim_id,
+					*package_target_feerate_sat_per_1000_weight,
+					claim_tx,
+					claim_output_descriptor,
+				)
+				.await
+				.unwrap_or_else(|_| {
+					log_error!(
+						self.logger,
+						"Failed bumping HTLC claim transaction {}",
+						claim_tx.compute_txid()
 					);
 				});
 			},
@@ -1004,6 +1225,95 @@ mod tests {
 			},
 			pending_htlcs: Vec::new(),
 		});
+	}
+
+	#[test]
+	fn test_htlcs_claim_tx_resolution() {
+		// Test that an `option_htlcs_claim_tx` HTLC claim transaction is fee-bumped by broadcasting
+		// a version 3 child spending its output, as a TRUC 1-parent-1-child package.
+		use crate::ln::chan_utils::get_countersigner_payment_script;
+		use crate::sign::ChannelSigner;
+
+		let secp = Secp256k1::new();
+		let keys_id = [42; 32];
+		let signer = KeysManager::new(&[42; 32], 42, 42, true);
+		let payment_point = signer.derive_channel_signer(keys_id).pubkeys(&secp).payment_point;
+
+		let mut channel_type = ChannelTypeFeatures::only_static_remote_key();
+		channel_type.set_anchor_zero_fee_commitments_required();
+		channel_type.set_htlcs_claim_tx_required();
+		// The claim transaction's output is a plain P2WPKH to our payment point.
+		let claim_output_script = get_countersigner_payment_script(&channel_type, &payment_point);
+
+		// A zero-fee version 3 claim transaction paying the full HTLC value to our payment point.
+		const CLAIM_VALUE: u64 = 1_000_000;
+		let claim_tx = Transaction {
+			version: Version::non_standard(3),
+			lock_time: LockTime::ZERO,
+			input: vec![TxIn {
+				previous_output: OutPoint::null(),
+				script_sig: ScriptBuf::new(),
+				sequence: Sequence(0),
+				witness: Witness::new(),
+			}],
+			output: vec![TxOut {
+				value: Amount::from_sat(CLAIM_VALUE),
+				script_pubkey: claim_output_script.clone(),
+			}],
+		};
+		let claim_txid = claim_tx.compute_txid();
+		let expected_must_spend_weight =
+			claim_tx.weight().to_wu() + P2WPKH_WITNESS_WEIGHT + EMPTY_SCRIPT_SIG_WEIGHT;
+
+		let mut transaction_parameters = ChannelTransactionParameters::test_dummy(42_000_000);
+		transaction_parameters.channel_type_features = channel_type;
+		let claim_output_descriptor = StaticPaymentOutputDescriptor {
+			outpoint: crate::chain::transaction::OutPoint { txid: claim_txid, index: 0 },
+			output: claim_tx.output[0].clone(),
+			channel_keys_id: keys_id,
+			channel_value_satoshis: 42_000_000,
+			channel_transaction_parameters: Some(transaction_parameters),
+		};
+
+		// The child keeps the claimed value minus a comfortable fee as a change output, so the
+		// package easily clears the (low) target feerate without needing external coins.
+		let target_feerate = 253;
+		let change_output = TxOut {
+			value: Amount::from_sat(CLAIM_VALUE - 5_000),
+			script_pubkey: claim_output_script,
+		};
+		let broadcaster = TestBroadcaster::new(Network::Testnet);
+		let source = TestCoinSelectionSource {
+			expected_selects: Mutex::new(vec![(
+				expected_must_spend_weight,
+				CLAIM_VALUE,
+				target_feerate,
+				CoinSelection { confirmed_utxos: Vec::new(), change_output: Some(change_output) },
+			)]),
+		};
+		let logger = TestLogger::new();
+		let handler = BumpTransactionEventHandlerSync::new(&broadcaster, &source, &signer, &logger);
+
+		handler.handle_event(&BumpTransactionEvent::HTLCsClaimTxResolution {
+			channel_id: ChannelId([42; 32]),
+			counterparty_node_id: PublicKey::from_slice(&[2; 33]).unwrap(),
+			claim_id: ClaimId([42; 32]),
+			package_target_feerate_sat_per_1000_weight: target_feerate,
+			claim_tx: claim_tx.clone(),
+			claim_output_descriptor,
+		});
+
+		// The claim transaction and its fee-paying child are broadcast together as a package.
+		let broadcasted = broadcaster.txn_broadcast();
+		assert_eq!(broadcasted.len(), 2);
+		assert_eq!(broadcasted[0], claim_tx);
+		let child = &broadcasted[1];
+		assert_eq!(child.version, Version::non_standard(3));
+		assert_eq!(child.input.len(), 1);
+		assert_eq!(child.input[0].previous_output, OutPoint { txid: claim_txid, vout: 0 });
+		// The child input spending the claim output is signed (P2WPKH: signature + pubkey).
+		assert_eq!(child.input[0].witness.len(), 2);
+		assert_eq!(child.output.len(), 1);
 	}
 
 	#[test]

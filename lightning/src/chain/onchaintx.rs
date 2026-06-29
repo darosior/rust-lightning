@@ -195,6 +195,16 @@ pub(crate) enum ClaimEvent {
 		htlcs: Vec<HTLCDescriptor>,
 		tx_lock_time: LockTime,
 	},
+	/// Event yielded to signal that an `option_htlcs_claim_tx` offered HTLC must be resolved by
+	/// broadcasting the fixed, zero-fee, template-committed v3 claim transaction alongside a
+	/// fee-paying child (a TRUC 1-parent-1-child package).
+	BumpHTLCsClaimTx {
+		target_feerate_sat_per_1000_weight: u32,
+		/// The fully-signed, template-committed, zero-fee v3 HTLC claim transaction to be confirmed
+		/// via a fee-paying child.
+		claim_tx: Transaction,
+		channel_parameters: ChannelTransactionParameters,
+	},
 }
 
 /// Represents the different ways an output can be claimed (i.e., spent to an address under our
@@ -740,8 +750,35 @@ impl<ChannelSigner: EcdsaChannelSigner> OnchainTxHandler<ChannelSigner> {
 						None => Some((new_timer, 0, OnchainClaim::Tx(MaybeSignedTransaction(tx)))),
 					}
 				},
+				// `option_htlcs_claim_tx`: the offered HTLC is resolved by broadcasting the fixed,
+				// zero-fee, template-committed v3 claim transaction. Since it pays no fee, it can
+				// only be relayed and confirmed alongside a fee-paying child (TRUC 1P1C), which we
+				// request from the user through a `BumpHTLCsClaimTx` event.
+				PackageSolvingData::CounterpartyOfferedHTLCOutput(output) => {
+					debug_assert!(output.channel_type_features().supports_htlcs_claim_tx());
+					let claim_tx = cached_request.maybe_finalize_untractable_package(self, logger)?;
+					if !claim_tx.is_fully_signed() {
+						// We couldn't sign the claim transaction as the signer was unavailable, but
+						// we should still retry it later. We return the unsigned transaction anyway
+						// to register the claim.
+						return Some((new_timer, 0, OnchainClaim::Tx(claim_tx)));
+					}
+					let target_feerate_sat_per_1000_weight = cached_request
+						.compute_package_feerate(fee_estimator, conf_target, feerate_strategy);
+					let channel_parameters = output.channel_parameters()
+						.unwrap_or(self.channel_parameters()).clone();
+					Some((
+						new_timer,
+						target_feerate_sat_per_1000_weight as u64,
+						OnchainClaim::Event(ClaimEvent::BumpHTLCsClaimTx {
+							target_feerate_sat_per_1000_weight,
+							claim_tx: claim_tx.0,
+							channel_parameters,
+						}),
+					))
+				},
 				_ => {
-					debug_assert!(false, "Only HolderFundingOutput inputs should be untractable and require external funding");
+					debug_assert!(false, "Only HolderFundingOutput and option_htlcs_claim_tx offered HTLC inputs should be untractable and require external funding");
 					None
 				},
 			})
@@ -909,6 +946,10 @@ impl<ChannelSigner: EcdsaChannelSigner> OnchainTxHandler<ChannelSigner> {
 								// underlying set of HTLCs changes.
 								ClaimId::from_htlcs(htlcs)
 							},
+							ClaimEvent::BumpHTLCsClaimTx { ref claim_tx, .. } =>
+								// The template-committed claim transaction spends a single HTLC
+								// output, so its txid is unique per request.
+								ClaimId(claim_tx.compute_txid().to_byte_array()),
 						};
 						debug_assert!(self.pending_claim_requests.get(&claim_id).is_none());
 						debug_assert_eq!(self.pending_claim_events.iter().filter(|entry| entry.0 == claim_id).count(), 0);
