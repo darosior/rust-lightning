@@ -19593,6 +19593,389 @@ mod tests {
 		});
 	}
 
+	// Test vectors from bolt03/htlcs-claim-tx-test.json
+	#[cfg(ldk_test_vectors)]
+	#[test]
+	fn htlcs_claim_tx_test_vectors() {
+		use crate::chain::transaction::OutPoint;
+		use crate::ln::chan_utils::{
+			build_htlc_claim_transaction, build_htlcs_claim_tx_witness, get_template_hash,
+			offered_htlc_taproot_spend_info, offered_htlc_tapscript_leaves,
+			CounterpartyChannelTransactionParameters, HolderCommitmentTransaction,
+		};
+		use crate::sign::ecdsa::EcdsaChannelSigner;
+		use crate::sync::Arc;
+		use crate::types::features::ChannelTypeFeatures;
+		use crate::util::config::UserConfig;
+		use crate::util::logger::Logger;
+		use crate::util::test_utils::{
+			payment_hash_from_hex, preimage_from_hex, pubkey_from_hex, secret_from_hex,
+		};
+		use bitcoin::consensus::encode::serialize;
+		use bitcoin::hash_types::Txid;
+		use bitcoin::hex::{DisplayHex, FromHex};
+		use bitcoin::secp256k1::Secp256k1;
+		use core::str::FromStr;
+
+		let feeest = TestFeeEstimator::new(250);
+		let logger: Arc<dyn Logger> = Arc::new(TestLogger::new());
+		let secp_ctx = Secp256k1::new();
+
+		let alice_funding_privkey =
+			secret_from_hex("8f567cb6382507019349a47623902aa65d7a142ac85462eeb63dc11799ac2bb9");
+		let alice_payment_basepoint_secret =
+			secret_from_hex("94f29d20a225ea2f7093331ba0f0f28a9382d8ed08e1fd121329925cd0c01b6d");
+		let alice_delayed_payment_basepoint_secret =
+			secret_from_hex("e9d4e1935bf16e948d76ad007baf0646df023af38f41bcf2c8799336949d291e");
+		let alice_htlc_basepoint_secret =
+			secret_from_hex("f699038ef4f95b6b16b22a5c04fcb3c508d68d02cd2f86cf197e0fac451681b0");
+		let alice_revocation_base_secret =
+			secret_from_hex("1111111111111111111111111111111111111111111111111111111111111111");
+
+		let alice_signer = InMemorySigner::new(
+			alice_funding_privkey,
+			alice_revocation_base_secret,
+			alice_payment_basepoint_secret,
+			alice_payment_basepoint_secret,
+			true,
+			alice_delayed_payment_basepoint_secret,
+			alice_htlc_basepoint_secret,
+			[0xff; 32],
+			[0; 32],
+			[0; 32],
+		);
+		let alice_keys_provider = Keys { signer: alice_signer.clone() };
+		let alice_pubkeys = alice_signer.pubkeys(&secp_ctx);
+
+		let bob_payment_basepoint_secret =
+			secret_from_hex("580bff39085f3a6ae8b1f32905e67366c522ea8f2418391145b2e98f1a7cb3f2");
+		let bob_htlc_basepoint_secret =
+			secret_from_hex("32df9c4dd46ab6210e74e81e15282106f8db883f45674eabb3324166c6513062");
+		let bob_funding_privkey =
+			secret_from_hex("4d22d96f0c0ccecffee4554d20ed43e51235917508ee292d281235bb7ebe0e3e");
+		let bob_revocation_base_secret =
+			secret_from_hex("2222222222222222222222222222222222222222222222222222222222222222");
+		let bob_delayed_payment_basepoint_secret =
+			secret_from_hex("2222222222222222222222222222222222222222222222222222222222222222");
+
+		let bob_signer = InMemorySigner::new(
+			bob_funding_privkey,
+			bob_revocation_base_secret,
+			bob_payment_basepoint_secret,
+			bob_payment_basepoint_secret,
+			true,
+			bob_delayed_payment_basepoint_secret,
+			bob_htlc_basepoint_secret,
+			[0xff; 32],
+			[0; 32],
+			[0; 32],
+		);
+
+		let mut bob_pubkeys = bob_signer.pubkeys(&secp_ctx);
+		bob_pubkeys.revocation_basepoint = RevocationBasepoint(pubkey_from_hex(
+			"026788d019ed90149cbc9aa5ff26dd7f1a6d3cd1bee8bf36cf7d8310fbd3606b14",
+		));
+
+		let bob_node_id = crate::util::test_utils::pubkey(2);
+		let mut config = UserConfig::default();
+		config.channel_handshake_config.negotiate_anchor_zero_fee_commitments = true;
+
+		let mut chan = OutboundV1Channel::<&Keys>::new(
+			&LowerBoundedFeeEstimator::new(&feeest),
+			&&alice_keys_provider,
+			&&alice_keys_provider,
+			bob_node_id,
+			&crate::ln::channelmanager::provided_init_features(&config),
+			10_000_000,
+			0,
+			0,
+			&config,
+			0,
+			0,
+			None,
+			&*logger,
+			None,
+		)
+		.unwrap();
+
+		chan.funding.counterparty_selected_channel_reserve_satoshis = Some(0);
+		chan.funding.holder_selected_channel_reserve_satoshis = 0;
+
+		let funding_txid_str = "4b70a2ee47b3005a6316ff87055e94c6b3d433d0fd3b384c9ecf7813843c1eae";
+		let funding_info = OutPoint { txid: Txid::from_str(funding_txid_str).unwrap(), index: 1 };
+
+		chan.funding.channel_transaction_parameters.holder_pubkeys = alice_pubkeys.clone();
+		chan.funding.channel_transaction_parameters.counterparty_parameters =
+			Some(CounterpartyChannelTransactionParameters {
+				pubkeys: bob_pubkeys.clone(),
+				selected_contest_delay: 720,
+			});
+		chan.funding.channel_transaction_parameters.funding_outpoint = Some(funding_info);
+
+		let mut channel_type_features = ChannelTypeFeatures::anchors_zero_fee_commitments();
+		channel_type_features.set_htlcs_claim_tx_required();
+		chan.funding.channel_transaction_parameters.channel_type_features =
+			channel_type_features.clone();
+
+		let per_commitment_point =
+			pubkey_from_hex("0275d12130c276b4274358a328901f8fc47e6c72629102e4b46c9f27dd2c1dda98");
+
+		let bob_payment_point =
+			PublicKey::from_secret_key(&secp_ctx, &bob_payment_basepoint_secret);
+
+		// Builds and signs a commitment tx as Alice (holder), signs the funding input as Bob
+		// (counterparty, via raw funding key), then asserts sigs and tx bytes. Returns the
+		// commitment txid, non-dust HTLCs, and the derived TxCreationKeys for further checks.
+		macro_rules! assert_commitment {
+			( $counterparty_sig_hex: expr, $holder_sig_hex: expr, $tx_hex: expr ) => {{
+				chan.funding.channel_transaction_parameters.channel_type_features =
+					channel_type_features.clone();
+				let commitment_data = chan.context.build_commitment_transaction(
+					&chan.funding,
+					0xffffffffffff - 42,
+					&per_commitment_point,
+					true,
+					false,
+					&logger,
+				);
+				let commitment_tx = commitment_data.tx;
+				let trusted_tx = commitment_tx.trust();
+				let unsigned_tx = trusted_tx.built_transaction();
+				let redeemscript = chan.funding.get_funding_redeemscript();
+				let commitment_txid = unsigned_tx.txid;
+
+				let counterparty_sig =
+					Signature::from_der(&<Vec<u8>>::from_hex($counterparty_sig_hex).unwrap())
+						.unwrap();
+				let sighash =
+					unsigned_tx.get_sighash_all(&redeemscript, chan.funding.get_value_satoshis());
+				assert!(
+					secp_ctx
+						.verify_ecdsa(
+							&sighash,
+							&counterparty_sig,
+							chan.funding.counterparty_funding_pubkey()
+						)
+						.is_ok(),
+					"counterparty sig"
+				);
+
+				let holder_commitment_tx = HolderCommitmentTransaction::new(
+					commitment_tx.clone(),
+					counterparty_sig,
+					vec![],
+					&alice_pubkeys.funding_pubkey,
+					chan.funding.counterparty_funding_pubkey(),
+				);
+				let holder_sig = alice_signer
+					.sign_holder_commitment(
+						&chan.funding.channel_transaction_parameters,
+						&holder_commitment_tx,
+						&secp_ctx,
+					)
+					.unwrap();
+				assert_eq!(
+					Signature::from_der(&<Vec<u8>>::from_hex($holder_sig_hex).unwrap()).unwrap(),
+					holder_sig,
+					"holder_sig"
+				);
+				let tx = holder_commitment_tx.add_holder_sig(&redeemscript, holder_sig);
+				assert_eq!(
+					serialize(&tx)[..],
+					<Vec<u8>>::from_hex($tx_hex).unwrap()[..],
+					"commit_tx"
+				);
+
+				(commitment_txid, commitment_tx.nondust_htlcs().to_vec(), trusted_tx.keys().clone())
+			}};
+		}
+
+		// Verifies the tapscript leaves, template hash, unsigned claim tx, and witnessed claim tx
+		// for a single offered HTLC output.
+		macro_rules! assert_htlc_claim_tx {
+			( $commitment_txid: expr, $htlc: expr, $keys: expr,
+			  $htlc_timeout_script_hex: expr, $htlc_success_script_hex: expr,
+			  $template_hash_hex: expr, $htlc_claim_tx_hex: expr,
+			  $htlc_claim_tx_with_witness_hex: expr, $preimage: expr ) => {{
+				let (htlc_timeout, htlc_success) = offered_htlc_tapscript_leaves(
+					&$htlc,
+					&$keys.broadcaster_htlc_key,
+					&$keys.countersignatory_htlc_key,
+					&bob_payment_point,
+				);
+				assert_eq!(
+					htlc_timeout.as_bytes().as_hex().to_string(),
+					$htlc_timeout_script_hex,
+					"htlc_timeout_script"
+				);
+				assert_eq!(
+					htlc_success.as_bytes().as_hex().to_string(),
+					$htlc_success_script_hex,
+					"htlc_success_script"
+				);
+
+				let claim_tx = build_htlc_claim_transaction(
+					bitcoin::transaction::OutPoint {
+						txid: $commitment_txid,
+						vout: $htlc.transaction_output_index.unwrap(),
+					},
+					&$htlc,
+					&bob_payment_point,
+				);
+				let template_hash = get_template_hash(&claim_tx, 0);
+				assert_eq!(template_hash.as_hex().to_string(), $template_hash_hex, "template_hash");
+				assert_eq!(
+					serialize(&claim_tx).as_hex().to_string(),
+					$htlc_claim_tx_hex,
+					"htlc_claim_tx"
+				);
+
+				let spend_info = offered_htlc_taproot_spend_info(
+					&$htlc,
+					&$keys.revocation_key,
+					&$keys.broadcaster_htlc_key,
+					&$keys.countersignatory_htlc_key,
+					&bob_payment_point,
+				);
+				let mut claim_tx_with_witness = claim_tx;
+				claim_tx_with_witness.input[0].witness =
+					build_htlcs_claim_tx_witness(&$preimage, &spend_info, &htlc_success);
+				assert_eq!(
+					serialize(&claim_tx_with_witness).as_hex().to_string(),
+					$htlc_claim_tx_with_witness_hex,
+					"htlc_claim_tx_with_witness"
+				);
+			}};
+		}
+
+		// Case 1: commitment transaction with a single outgoing HTLC above dust.
+		chan.context.holder_dust_limit_satoshis = 5000;
+		chan.funding.value_to_self_msat = 7925000000;
+		chan.context.pending_outbound_htlcs.extend(
+			[(
+				5u64,
+				"72c9386ba5a9d97b821d855930236d39c48dab5b1c2efe9ada44e2fbadcff983",
+				25000000u64,
+			)]
+			.map(|(htlc_id, hash_str, amount_msat)| OutboundHTLCOutput {
+				htlc_id,
+				amount_msat,
+				cltv_expiry: 920141,
+				payment_hash: payment_hash_from_hex(hash_str),
+				state: OutboundHTLCState::Committed,
+				source: HTLCSource::dummy(),
+				skimmed_fee_msat: None,
+				blinding_point: None,
+				send_timestamp: None,
+				hold_htlc: None,
+				accountable: false,
+			}),
+		);
+		let (txid_1, htlcs_1, keys_1) = assert_commitment!(
+			"30450221008751c005679210d03024acbc9b7d48fcc4fdef4705ccc57e807d08b03ac7195002201d7dad4dd5175ab45989ec1ba73027b43d731168c527a001c3461010a5c9e094",
+			"304402207f0326a70ede1f74e48c139d917f0088d31761512247ef616e9ea892789ef8dc022062ef129647840952bb5a6512d56d56615b43fddd0372a40737bed33673548ccd",
+			"03000000000101ae1e3c841378cf9e4c383bfdd033d4b3c6945e0587ff16635a00b347eea2704b0100000000340fef800400000000000000000451024e73a861000000000000225120ac5217e5ac3039da7f479095f44d7058470dc146583c7412bcef9f4b6c820db878a91f0000000000160014f2123f1a4b67887f2e5f02eda73e6327010152ea608b780000000000220020f2d298ffcfd6d899a3abada37bfc6f42ce0b7b66f3e39e903e8419ac97dca75a04004830450221008751c005679210d03024acbc9b7d48fcc4fdef4705ccc57e807d08b03ac7195002201d7dad4dd5175ab45989ec1ba73027b43d731168c527a001c3461010a5c9e0940147304402207f0326a70ede1f74e48c139d917f0088d31761512247ef616e9ea892789ef8dc022062ef129647840952bb5a6512d56d56615b43fddd0372a40737bed33673548ccd01475221027eb9596a68740445fb151ff37d5422e7f65f2c497c90fda63e738eb606c15bd62103bbc16dc8851bece603322f06b3c8da329401b7be7e9fdd3f3090ad19aed0807052aec50fbb20"
+		);
+		let htlc_1 = htlcs_1.into_iter().find(|h| h.offered).unwrap();
+		assert_htlc_claim_tx!(txid_1, htlc_1, keys_1,
+			"20c26117339025855b87deda5e138d438b2098881a5e6f81f72a60310faef473c6ad20d8507a026fb30bcd48ee9c765c7346470d0d397661d43dd2eb601f661ab92a0bac",
+			"82012088a914488ed834d26f1a1dc5e3428e1e1a214f743e6a2488204f46273b2c989d2183e1379c396f5b575b859862c20938318418f31b6cedd17fce87",
+			"4f46273b2c989d2183e1379c396f5b575b859862c20938318418f31b6cedd17f",
+			"030000000104430f5dfcde134fc4f7e5b6c345d8ea47d3bf2cad01fa3efa27a757296b165201000000000000000001a861000000000000160014f2123f1a4b67887f2e5f02eda73e6327010152ea00000000",
+			"0300000000010104430f5dfcde134fc4f7e5b6c345d8ea47d3bf2cad01fa3efa27a757296b165201000000000000000001a861000000000000160014f2123f1a4b67887f2e5f02eda73e6327010152ea03205591b96c0a6a03f51c27bfa658149260bd2fe5e2ce83130ce50d0229a3a947c53e82012088a914488ed834d26f1a1dc5e3428e1e1a214f743e6a2488204f46273b2c989d2183e1379c396f5b575b859862c20938318418f31b6cedd17fce8741c170308d9e9b4846a1b51accdae500e43383b11e906d0fab0a1e0f5ba203d3ccdcd23dd8e923d3880bee23a2b95d54c89c8a4d82a5903e96be5f0e99c262bb126300000000",
+			preimage_from_hex("5591b96c0a6a03f51c27bfa658149260bd2fe5e2ce83130ce50d0229a3a947c5")
+		);
+		chan.context.pending_outbound_htlcs.clear();
+
+		// Case 2: millisatoshi truncation — 25000821 msat rounds down to 25000 sat in the claim tx.
+		chan.funding.value_to_self_msat = 7900000000;
+		chan.context.pending_outbound_htlcs.extend(
+			[(
+				8u64,
+				"10b879729e8ddd44f2cfcf3cad6d62be535ca74e293c5ed4a59bd0dcbdad7ca1",
+				25000821u64,
+			)]
+			.map(|(htlc_id, hash_str, amount_msat)| OutboundHTLCOutput {
+				htlc_id,
+				amount_msat,
+				cltv_expiry: 920141,
+				payment_hash: payment_hash_from_hex(hash_str),
+				state: OutboundHTLCState::Committed,
+				source: HTLCSource::dummy(),
+				skimmed_fee_msat: None,
+				blinding_point: None,
+				send_timestamp: None,
+				hold_htlc: None,
+				accountable: false,
+			}),
+		);
+		let (txid_2, htlcs_2, keys_2) = assert_commitment!(
+			"30440220397404d3725e7dd53116c4a4bbfa33e0c2bf9cd141ef798273d5bbdd9cddcd6f02202169308d71911d2e44bda9c3da1c03faaf854b72b274bce9253e24ba108ccb23",
+			"304402207363d0a8b6e86b8c1a7b5e249d7c1ae1633433dc4cd741b760a9f37999c50bcd02200a14d835b77d2204554337320da5fd099462d24af836ac818bdf00e04967ebef",
+			"03000000000101ae1e3c841378cf9e4c383bfdd033d4b3c6945e0587ff16635a00b347eea2704b0100000000340fef800401000000000000000451024e73a8610000000000002251208b74ecccf0ec6463d625e6bf7f5e2161fc34e3110f894fe9189e6a9c5317d367200b200000000000160014f2123f1a4b67887f2e5f02eda73e6327010152eab729780000000000220020f2d298ffcfd6d899a3abada37bfc6f42ce0b7b66f3e39e903e8419ac97dca75a04004730440220397404d3725e7dd53116c4a4bbfa33e0c2bf9cd141ef798273d5bbdd9cddcd6f02202169308d71911d2e44bda9c3da1c03faaf854b72b274bce9253e24ba108ccb230147304402207363d0a8b6e86b8c1a7b5e249d7c1ae1633433dc4cd741b760a9f37999c50bcd02200a14d835b77d2204554337320da5fd099462d24af836ac818bdf00e04967ebef01475221027eb9596a68740445fb151ff37d5422e7f65f2c497c90fda63e738eb606c15bd62103bbc16dc8851bece603322f06b3c8da329401b7be7e9fdd3f3090ad19aed0807052aec50fbb20"
+		);
+		let htlc_2 = htlcs_2.into_iter().find(|h| h.offered).unwrap();
+		assert_htlc_claim_tx!(txid_2, htlc_2, keys_2,
+			"20c26117339025855b87deda5e138d438b2098881a5e6f81f72a60310faef473c6ad20d8507a026fb30bcd48ee9c765c7346470d0d397661d43dd2eb601f661ab92a0bac",
+			"82012088a914504170790db95d43716b136806e6a0fdf06e39e488204f46273b2c989d2183e1379c396f5b575b859862c20938318418f31b6cedd17fce87",
+			"4f46273b2c989d2183e1379c396f5b575b859862c20938318418f31b6cedd17f",
+			"030000000100886fcf3999d07f5a886f193db5f1d004daa960235f303726accf3bb20bc04d01000000000000000001a861000000000000160014f2123f1a4b67887f2e5f02eda73e6327010152ea00000000",
+			"0300000000010100886fcf3999d07f5a886f193db5f1d004daa960235f303726accf3bb20bc04d01000000000000000001a861000000000000160014f2123f1a4b67887f2e5f02eda73e6327010152ea0320c916e086a4cd7d40f198708aefadd31149da628f820ca2fc213af10f7668501c3e82012088a914504170790db95d43716b136806e6a0fdf06e39e488204f46273b2c989d2183e1379c396f5b575b859862c20938318418f31b6cedd17fce8741c070308d9e9b4846a1b51accdae500e43383b11e906d0fab0a1e0f5ba203d3ccdcd23dd8e923d3880bee23a2b95d54c89c8a4d82a5903e96be5f0e99c262bb126300000000",
+			preimage_from_hex("c916e086a4cd7d40f198708aefadd31149da628f820ca2fc213af10f7668501c")
+		);
+		chan.context.pending_outbound_htlcs.clear();
+
+		// Case 3: one outgoing (P2TR) + one incoming (P2WSH, unchanged) HTLC.
+		chan.funding.value_to_self_msat = 7000000000;
+		let htlc_in_preimage =
+			preimage_from_hex("108cd7067c8ed6f3734b7b67ec153cfa83c40755b75c65e414e934099e6993aa");
+		chan.context.pending_inbound_htlcs.extend([1u64].map(|id| InboundHTLCOutput {
+			htlc_id: id,
+			amount_msat: 5000000,
+			cltv_expiry: 920150,
+			payment_hash: PaymentHash::from(htlc_in_preimage),
+			state: InboundHTLCState::Committed { update_add_htlc: dummy_inbound_update_add() },
+		}));
+		chan.context.pending_outbound_htlcs.extend(
+			[(
+				5u64,
+				"72c9386ba5a9d97b821d855930236d39c48dab5b1c2efe9ada44e2fbadcff983",
+				25000000u64,
+			)]
+			.map(|(htlc_id, hash_str, amount_msat)| OutboundHTLCOutput {
+				htlc_id,
+				amount_msat,
+				cltv_expiry: 920141,
+				payment_hash: payment_hash_from_hex(hash_str),
+				state: OutboundHTLCState::Committed,
+				source: HTLCSource::dummy(),
+				skimmed_fee_msat: None,
+				blinding_point: None,
+				send_timestamp: None,
+				hold_htlc: None,
+				accountable: false,
+			}),
+		);
+		let (txid_3, htlcs_3, keys_3) = assert_commitment!(
+			"304402205f818e459e0ec72dc00eba606eca389af4726c39d7f16a3570c64d26cbad665f02201333cefd527c771135fff156043f9429e2228c981f42cf54bcad3bf45805b599",
+			"30440220195dfbc8eaef5e18212c268f6d5d9a251463ef52334bd1f8f3ecdff263e7a42102200c6faa6b316d7bb16246cc30553fd53e2731e45f190fb84dedc0220f907f4fc3",
+			"03000000000101ae1e3c841378cf9e4c383bfdd033d4b3c6945e0587ff16635a00b347eea2704b0100000000340fef800500000000000000000451024e73881300000000000022002075254560bb02c207015847abfda36d3a1b882e78c3f04b08325aac21c53989dca861000000000000225120ac5217e5ac3039da7f479095f44d7058470dc146583c7412bcef9f4b6c820db838b32d0000000000160014f2123f1a4b67887f2e5f02eda73e6327010152ea186e6a0000000000220020f2d298ffcfd6d899a3abada37bfc6f42ce0b7b66f3e39e903e8419ac97dca75a040047304402205f818e459e0ec72dc00eba606eca389af4726c39d7f16a3570c64d26cbad665f02201333cefd527c771135fff156043f9429e2228c981f42cf54bcad3bf45805b599014730440220195dfbc8eaef5e18212c268f6d5d9a251463ef52334bd1f8f3ecdff263e7a42102200c6faa6b316d7bb16246cc30553fd53e2731e45f190fb84dedc0220f907f4fc301475221027eb9596a68740445fb151ff37d5422e7f65f2c497c90fda63e738eb606c15bd62103bbc16dc8851bece603322f06b3c8da329401b7be7e9fdd3f3090ad19aed0807052aec50fbb20"
+		);
+		// Received HTLC stays as P2WSH (output index 1); offered HTLC is P2TR (output index 2).
+		let htlc_3 = htlcs_3.into_iter().find(|h| h.offered).unwrap();
+		assert_htlc_claim_tx!(txid_3, htlc_3, keys_3,
+			"20c26117339025855b87deda5e138d438b2098881a5e6f81f72a60310faef473c6ad20d8507a026fb30bcd48ee9c765c7346470d0d397661d43dd2eb601f661ab92a0bac",
+			"82012088a914488ed834d26f1a1dc5e3428e1e1a214f743e6a2488204f46273b2c989d2183e1379c396f5b575b859862c20938318418f31b6cedd17fce87",
+			"4f46273b2c989d2183e1379c396f5b575b859862c20938318418f31b6cedd17f",
+			"03000000013d08505cc774eb835f4f655a12f1ae4f8338b4af2638c875057cee69d2e890b002000000000000000001a861000000000000160014f2123f1a4b67887f2e5f02eda73e6327010152ea00000000",
+			"030000000001013d08505cc774eb835f4f655a12f1ae4f8338b4af2638c875057cee69d2e890b002000000000000000001a861000000000000160014f2123f1a4b67887f2e5f02eda73e6327010152ea03205591b96c0a6a03f51c27bfa658149260bd2fe5e2ce83130ce50d0229a3a947c53e82012088a914488ed834d26f1a1dc5e3428e1e1a214f743e6a2488204f46273b2c989d2183e1379c396f5b575b859862c20938318418f31b6cedd17fce8741c170308d9e9b4846a1b51accdae500e43383b11e906d0fab0a1e0f5ba203d3ccdcd23dd8e923d3880bee23a2b95d54c89c8a4d82a5903e96be5f0e99c262bb126300000000",
+			preimage_from_hex("5591b96c0a6a03f51c27bfa658149260bd2fe5e2ce83130ce50d0229a3a947c5")
+		);
+		chan.context.pending_inbound_htlcs.clear();
+		chan.context.pending_outbound_htlcs.clear();
+		let _ = htlc_in_preimage;
+	}
+
 	#[test]
 	#[rustfmt::skip]
 	fn test_per_commitment_secret_gen() {
