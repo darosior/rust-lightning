@@ -22,3 +22,7 @@
      signs the child's input spending the claim transaction output. The default
      `BumpTransactionEventHandler` constructs, signs, and broadcasts the package automatically. Do
      not enable on mainnet.
+   * The counterparty's `ChannelMonitor` recognizes the templated claim transaction's P2TR
+     script-path witness (`[preimage, htlc_success_script, control_block]`) as an offered-HTLC
+     preimage claim via `HTLCClaim::from_witness`, extracting the preimage from it so the offering
+     (or a forwarding) node can resolve the corresponding HTLC on-chain.

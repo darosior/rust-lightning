@@ -16,7 +16,10 @@ use bitcoin::opcodes;
 use bitcoin::script::{Builder, Script, ScriptBuf};
 use bitcoin::sighash;
 use bitcoin::sighash::EcdsaSighashType;
-use bitcoin::taproot::{LeafVersion, TaprootBuilder, TaprootSpendInfo};
+use bitcoin::taproot::{
+	LeafVersion, TaprootBuilder, TaprootSpendInfo, TAPROOT_CONTROL_BASE_SIZE,
+	TAPROOT_CONTROL_NODE_SIZE,
+};
 use bitcoin::transaction::Version;
 use bitcoin::transaction::{OutPoint, Transaction, TxIn, TxOut};
 use bitcoin::{PubkeyHash, WPubkeyHash};
@@ -207,6 +210,30 @@ pub enum HTLCClaim {
 	Revocation,
 }
 
+/// Whether `witness` spends an `option_htlcs_claim_tx` offered HTLC output through the preimage
+/// (`htlc_success`) path. Unlike the legacy P2WSH HTLC claims, this is a P2TR script-path spend of
+/// the form `[preimage, htlc_success_script, control_block]`, where the leaf script commits, via
+/// `OP_TEMPLATEHASH`, to the fixed HTLC claim transaction (see [`offered_htlc_tapscript_leaves`]).
+pub(crate) fn is_htlcs_claim_tx_offered_preimage_witness(witness: &Witness) -> bool {
+	if witness.len() != 3 {
+		return false;
+	}
+	// `[preimage(32), htlc_success_script, control_block]`.
+	let (Some(preimage), Some(leaf_script), Some(control_block)) =
+		(witness.nth(0), witness.second_to_last(), witness.last())
+	else {
+		return false;
+	};
+	// The witness elements must have the shape produced by `build_htlcs_claim_tx_witness`: a
+	// 32-byte preimage, a well-formed taproot control block, and the `htlc_success` leaf script,
+	// which is uniquely identified by its trailing `OP_TEMPLATEHASH OP_EQUAL`.
+	preimage.len() == 32
+		&& control_block.len() >= TAPROOT_CONTROL_BASE_SIZE
+		&& (control_block.len() - TAPROOT_CONTROL_BASE_SIZE) % TAPROOT_CONTROL_NODE_SIZE == 0
+		&& leaf_script
+			.ends_with(&[opcodes::all::OP_TEMPLATEHASH.to_u8(), opcodes::all::OP_EQUAL.to_u8()])
+}
+
 impl HTLCClaim {
 	/// Check if a given input witness attempts to claim a HTLC.
 	#[rustfmt::skip]
@@ -214,6 +241,12 @@ impl HTLCClaim {
 		debug_assert_eq!(OFFERED_HTLC_SCRIPT_WEIGHT_KEYED_ANCHORS, MIN_ACCEPTED_HTLC_SCRIPT_WEIGHT);
 		if witness.len() < 2 {
 			return None;
+		}
+		// `option_htlcs_claim_tx`: an offered HTLC claimed via the preimage path is a P2TR
+		// script-path spend, structurally distinct from the legacy P2WSH HTLC witnesses handled
+		// below (its preimage is the *first* witness element, not the second-to-last).
+		if is_htlcs_claim_tx_offered_preimage_witness(witness) {
+			return Some(Self::OfferedPreimage);
 		}
 		let witness_script = witness.last().unwrap();
 		let second_to_last = witness.second_to_last().unwrap();
@@ -3242,5 +3275,64 @@ mod tests {
 			&countersignatory_payment_point,
 		);
 		assert!(spk.is_p2tr());
+	}
+
+	#[test]
+	fn test_htlcs_claim_tx_witness_classification() {
+		// The witness spending an `option_htlcs_claim_tx` offered HTLC via the preimage path is a
+		// P2TR script-path spend, which `HTLCClaim::from_witness` must recognize as an
+		// `OfferedPreimage` claim (so the monitor extracts the preimage and resolves the HTLC).
+		use super::{
+			build_htlcs_claim_tx_witness, offered_htlc_taproot_spend_info,
+			offered_htlc_tapscript_leaves, HTLCClaim, HtlcKey, RevocationKey,
+		};
+		use crate::types::payment::PaymentPreimage;
+		use bitcoin::Witness;
+
+		let secp_ctx = Secp256k1::new();
+		let key = |b: u8| {
+			PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[b; 32]).unwrap())
+		};
+		let revocation_key = RevocationKey(key(1));
+		let broadcaster_htlc_key = HtlcKey(key(2));
+		let countersignatory_htlc_key = HtlcKey(key(3));
+		let countersignatory_payment_point = key(4);
+
+		let htlc = HTLCOutputInCommitment {
+			offered: true,
+			amount_msat: 1_234_567,
+			cltv_expiry: 500,
+			payment_hash: PaymentHash([0x42; 32]),
+			transaction_output_index: Some(0),
+		};
+
+		let (_htlc_timeout, htlc_success) = offered_htlc_tapscript_leaves(
+			&htlc,
+			&broadcaster_htlc_key,
+			&countersignatory_htlc_key,
+			&countersignatory_payment_point,
+		);
+		let spend_info = offered_htlc_taproot_spend_info(
+			&htlc,
+			&revocation_key,
+			&broadcaster_htlc_key,
+			&countersignatory_htlc_key,
+			&countersignatory_payment_point,
+		);
+		let preimage = PaymentPreimage([0xcd; 32]);
+		let witness = build_htlcs_claim_tx_witness(&preimage, &spend_info, &htlc_success);
+
+		// Recognized as an offered-preimage claim, with the preimage as the *first* witness element.
+		assert_eq!(witness.len(), 3);
+		assert!(HTLCClaim::from_witness(&witness) == Some(HTLCClaim::OfferedPreimage));
+		assert_eq!(witness.nth(0).unwrap(), &preimage.0[..]);
+
+		// A same-shaped witness whose leaf script does not commit via `OP_TEMPLATEHASH` is not
+		// misclassified as a templated claim.
+		let mut not_templated = Witness::new();
+		not_templated.push(preimage.0.to_vec());
+		not_templated.push(vec![0x51; htlc_success.as_bytes().len()]); // OP_TRUE-filled leaf
+		not_templated.push(witness.last().unwrap().to_vec());
+		assert!(HTLCClaim::from_witness(&not_templated) != Some(HTLCClaim::OfferedPreimage));
 	}
 }

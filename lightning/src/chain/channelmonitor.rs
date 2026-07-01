@@ -6242,7 +6242,17 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 
 			let mut payment_preimage = PaymentPreimage([0; 32]);
 			if offered_preimage_claim || accepted_preimage_claim {
-				payment_preimage.0.copy_from_slice(input.witness.second_to_last().unwrap());
+				// For legacy P2WSH HTLC claims the 32-byte preimage is the second-to-last witness
+				// element. For `option_htlcs_claim_tx` templated (P2TR script-path) offered-HTLC
+				// claims the witness is `[preimage, htlc_success_script, control_block]`, so the
+				// preimage is instead the first element.
+				let second_to_last = input.witness.second_to_last().unwrap();
+				let preimage = if second_to_last.len() == 32 {
+					second_to_last
+				} else {
+					input.witness.nth(0).unwrap()
+				};
+				payment_preimage.0.copy_from_slice(preimage);
 			}
 
 			macro_rules! log_claim {
